@@ -1,5 +1,5 @@
 """Avito monitor Telegram bot. Run with: python bot.py"""
-import asyncio, hashlib, os, re
+import asyncio, hashlib, os, re, logging
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("avito-bot")
 TOKEN = os.environ["BOT_TOKEN"]
 API_ROOT = os.getenv("TELEGRAM_API_ROOT", "https://api.telegram.org").rstrip("/")
 INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
@@ -83,6 +85,7 @@ async def rotate_ip():
         async with s.post(ROTATE_URL, headers=headers, timeout=20) as r: return r.status < 300
 
 async def scrape(page, url):
+    log.info("Открываю Avito: %s", url)
     await page.goto(url, wait_until="domcontentloaded", timeout=45000); await page.wait_for_timeout(2500)
     cards = await page.locator('[data-marker="item"] , [data-marker="item-link"]').all()
     out = []
@@ -93,6 +96,7 @@ async def scrape(page, url):
         if href.startswith("/"): href = "https://www.avito.ru" + href
         item_id = hashlib.sha256(href.encode()).hexdigest()[:32]
         out.append((item_id, text[:500], href))
+    log.info("Avito вернуло карточек: %d", len(out))
     return out
 
 async def check_one(browser, row, bot, sem):
@@ -102,7 +106,8 @@ async def check_one(browser, row, bot, sem):
             try:
                 context = await browser.new_context(proxy={"server": PROXY} if PROXY else None)
                 page = await context.new_page(); items = await scrape(page, url); await context.close(); break
-            except Exception:
+            except Exception as exc:
+                log.exception("Ошибка проверки ссылки %s: %s", url, exc)
                 if attempt == 0 and await rotate_ip(): await asyncio.sleep(5)
                 else: return
         cutoff = datetime.now(timezone.utc) - timedelta(hours=FRESH_HOURS)
@@ -111,7 +116,9 @@ async def check_one(browser, row, bot, sem):
                 exists = await (await db.execute("SELECT 1 FROM seen WHERE search_id=? AND item_id=?", (sid,iid))).fetchone()
                 await db.execute("INSERT OR IGNORE INTO seen VALUES(?,?,?)", (sid,iid,datetime.now(timezone.utc).isoformat()))
                 # First-seen is the only reliable freshness signal without opening every item.
-                if not exists: await bot.send_message(chat, f"{title}\n{href}")
+                if not exists:
+                    await bot.send_message(chat, f"{title}\n{href}")
+                    log.info("Отправлено новое объявление в чат %s", chat)
             await db.commit()
 
 async def monitor(bot):
@@ -121,11 +128,13 @@ async def monitor(bot):
         try:
             while True:
                 async with aiosqlite.connect(DB_PATH) as db: rows = await (await db.execute("SELECT id,chat_id,url FROM searches WHERE active=1")).fetchall()
+                log.info("Активных ссылок: %d", len(rows))
                 await asyncio.gather(*(check_one(browser, r, bot, sem) for r in rows)); await asyncio.sleep(INTERVAL)
         finally: await browser.close()
 
 async def main():
-    await db_init(); server = TelegramAPIServer.from_base(API_ROOT) if API_ROOT != "https://api.telegram.org" else None
+    await db_init(); log.info("Бот запускается; интервал проверки %s секунд", INTERVAL)
+    server = TelegramAPIServer.from_base(API_ROOT) if API_ROOT != "https://api.telegram.org" else None
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML), server=server)
     dp = Dispatcher(); dp.include_router(router)
     await asyncio.gather(dp.start_polling(bot), monitor(bot))
