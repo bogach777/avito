@@ -1,5 +1,6 @@
 """Avito monitor Telegram bot. Run with: python bot.py"""
 import asyncio, hashlib, os, re, logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -27,12 +28,13 @@ PROXY = os.getenv("AVITO_PROXY") or None
 ROTATE_URL, ROTATE_TOKEN = os.getenv("PROXY_ROTATE_URL"), os.getenv("PROXY_ROTATE_TOKEN")
 
 
+@asynccontextmanager
 async def db_connect():
     """Open a SQLite connection configured for concurrent async checks."""
-    db = await aiosqlite.connect(DB_PATH, timeout=30)
-    await db.execute("PRAGMA journal_mode=WAL")
-    await db.execute("PRAGMA busy_timeout=30000")
-    return db
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=30000")
+        yield db
 
 TEXT = {
     "welcome": "Пришлите ссылку поиска Avito. Бот сохранит все фильтры из ссылки и будет искать новые объявления.",
