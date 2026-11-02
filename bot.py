@@ -26,6 +26,14 @@ DB_PATH = os.getenv("DATABASE_PATH", "avito_bot.sqlite3")
 PROXY = os.getenv("AVITO_PROXY") or None
 ROTATE_URL, ROTATE_TOKEN = os.getenv("PROXY_ROTATE_URL"), os.getenv("PROXY_ROTATE_TOKEN")
 
+
+async def db_connect():
+    """Open a SQLite connection configured for concurrent async checks."""
+    db = await aiosqlite.connect(DB_PATH, timeout=30)
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA busy_timeout=30000")
+    return db
+
 TEXT = {
     "welcome": "Пришлите ссылку поиска Avito. Бот сохранит все фильтры из ссылки и будет искать новые объявления.",
     "saved": "Ссылка добавлена. Проверка выполняется каждые {seconds} секунд.",
@@ -38,7 +46,7 @@ router = Router()
 MENU = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="➕ Добавить ссылку"), KeyboardButton(text="📋 Мои ссылки")], [KeyboardButton(text="📖 Инструкция"), KeyboardButton(text="🛑 Остановить")]], resize_keyboard=True)
 
 async def db_init():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with await db_connect() as db:
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS searches(id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, url TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, UNIQUE(chat_id,url));
         CREATE TABLE IF NOT EXISTS seen(search_id INTEGER NOT NULL, item_id TEXT NOT NULL, first_seen TEXT NOT NULL, PRIMARY KEY(search_id,item_id));
@@ -60,13 +68,13 @@ async def help_(m: Message): await m.answer(TEXT["help"], reply_markup=MENU)
 
 @router.message(F.text == "📋 Мои ссылки")
 async def list_(m: Message):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with await db_connect() as db:
         rows = await (await db.execute("SELECT id,url,active FROM searches WHERE chat_id=? ORDER BY id", (m.chat.id,))).fetchall()
     await m.answer(TEXT["list_empty"] if not rows else "\n".join(f"{i}. {'✅' if a else '⏸️'} {u}" for i,u,a in rows))
 
 @router.message(F.text == "🛑 Остановить")
 async def stop(m: Message):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with await db_connect() as db:
         await db.execute("UPDATE searches SET active=0 WHERE chat_id=?", (m.chat.id,)); await db.commit()
     await m.answer(TEXT["stopped"], reply_markup=MENU)
 
@@ -74,7 +82,7 @@ async def stop(m: Message):
 async def add_url(m: Message):
     url = m.text.strip()
     if not valid_url(url): return await m.answer(TEXT["bad_url"])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with await db_connect() as db:
         await db.execute("INSERT OR IGNORE INTO searches(chat_id,url,created_at) VALUES(?,?,?)", (m.chat.id,url,datetime.now(timezone.utc).isoformat())); await db.commit()
     await m.answer(TEXT["saved"].format(seconds=INTERVAL), reply_markup=MENU)
 
@@ -111,7 +119,7 @@ async def check_one(browser, row, bot, sem):
                 if attempt == 0 and await rotate_ip(): await asyncio.sleep(5)
                 else: return
         cutoff = datetime.now(timezone.utc) - timedelta(hours=FRESH_HOURS)
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with await db_connect() as db:
             for iid, title, href in items:
                 exists = await (await db.execute("SELECT 1 FROM seen WHERE search_id=? AND item_id=?", (sid,iid))).fetchone()
                 await db.execute("INSERT OR IGNORE INTO seen VALUES(?,?,?)", (sid,iid,datetime.now(timezone.utc).isoformat()))
@@ -127,7 +135,7 @@ async def monitor(bot):
         browser = await pw.chromium.launch(headless=True)
         try:
             while True:
-                async with aiosqlite.connect(DB_PATH) as db: rows = await (await db.execute("SELECT id,chat_id,url FROM searches WHERE active=1")).fetchall()
+                async with await db_connect() as db: rows = await (await db.execute("SELECT id,chat_id,url FROM searches WHERE active=1")).fetchall()
                 log.info("Активных ссылок: %d", len(rows))
                 await asyncio.gather(*(check_one(browser, r, bot, sem) for r in rows)); await asyncio.sleep(INTERVAL)
         finally: await browser.close()
